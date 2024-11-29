@@ -1,5 +1,5 @@
 #include "../include/cuda_aux.cuh"
-#define TILE_SIZE 16
+#include "matmul.h"
 
 __global__ void MatMulKernel(const double *A, const double *B, double *C,
                              const int M, const int K, const int N) {
