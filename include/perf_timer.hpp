@@ -2,7 +2,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace Common {
+namespace Nix {
 /*
     Source for measuring kernel execution time
 

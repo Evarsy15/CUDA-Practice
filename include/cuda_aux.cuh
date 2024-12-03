@@ -18,14 +18,17 @@ inline __device__ __host__ int floor(int M, int N)
 /* 
     Correctness check functions
 */
-inline __host__ bool isEqual_float(float true_val, float measured_val, const float tolerance) {
-    float relative_error = (true_val - measured_val) / true_val;
+namespace Nix {
+
+template <typename data_t>
+inline __host__ __device__ bool isEqual(data_t true_val, data_t measured_val, const data_t tolerance) {
+    data_t relative_error = (true_val - measured_val) / true_val;
     return (abs(relative_error) < tolerance);
 }
 
-inline __host__ bool isEqual_double(double true_val, double measured_val, const double tolerance) {
-    float relative_error = (true_val - measured_val) / true_val;
-    return (abs(relative_error) < tolerance);
+template __host__ __device__ bool isEqual<float>(float true_val, float measured_val, const float tolerance);
+template __host__ __device__ bool isEqual<double>(double true_val, double measured_val, const double tolerance);
+
 }
 
 #endif

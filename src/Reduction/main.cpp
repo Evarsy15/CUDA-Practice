@@ -28,8 +28,14 @@ int main(int argc, char *argv[]) {
     double res = ReduceSum<double>(d_1, d_2, N, num_threads);
 
     // Correctness check
-    if (isEqual_double(ans, res, (double)1e-10)) {
+    if (Nix::isEqual<double>(ans, res, (double)1e-10)) {
         std::cout << "ReduceSum Kernel succeeded.\n";
+    /*
+        if (verbose) {
+            std::cout << "Answer(Host) = " << ans << ", Result(Device) = " << res << "\n";
+            std::cout << "Relative Error = " << (ans - res) / ans << "\n";
+        }
+    */
     } else {
         std::cout << "ReduceSum Kernel failed.\n";
         std::cout << "Answer(Host) = " << ans << ", Result(Device) = " << res << "\n";

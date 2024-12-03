@@ -1,8 +1,8 @@
 #include "reduce_sum_aux.hpp"
 
-template <typename dType>
-dType host_reduce_sum(dType *src, int N) {
-    dType acc = (dType) 0;
+template <typename data_t>
+data_t host_reduce_sum(data_t *src, int N) {
+    data_t acc = (data_t) 0;
     for (int i = 0; i < N; i++) {
         acc += src[i];
     }
