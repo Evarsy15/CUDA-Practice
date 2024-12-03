@@ -7,7 +7,7 @@ namespace Common {
     Source for measuring kernel execution time
 
     Original code provided by :
-        >> Cite <<
+        >> Adapted from WindyDarian (https://github.com/WindyDarian) <<
 */
 class PerfTimer {
 public:

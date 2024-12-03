@@ -9,5 +9,5 @@ dType host_reduce_sum(dType *src, int N) {
     return acc;
 }
 
-template host_reduce_sum<float> (float *src,  int N);
-template host_reduce_sum<double>(double *src, int N);
+// Explicit instantiation
+template double host_reduce_sum<double>(double *src, int N);

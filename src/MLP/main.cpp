@@ -8,7 +8,7 @@
 #define in_dim 15
 #define epochs 400
 #define inputs in_dim*in_dim
-#define batch 64
+#define batch 16
 
 using namespace std;
 
