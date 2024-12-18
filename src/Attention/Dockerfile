@@ -15,6 +15,7 @@ RUN pip3 install --no-cache-dir ninja
 
 # Clone the simple-flash-attention repository
 RUN git clone https://github.com/YWHyuk/simple-flash-attention.git
+RUN git clone https://github.com/Evarsy15/CUDA-Practice.git
 
 # Set entry point
 CMD ["/bin/bash"]
