@@ -59,7 +59,7 @@ __global__ void scaled_dot_product(const float *Q, const float *K, float *S,
     __shared__ float tile_K[tile_size][tile_size+1];
 
     float acc = 0.0;
-    for (int i = 0; i < E; i += tile_size) {
+    for (int i = 0; i < D; i += tile_size) {
         // Load tiles of operand matrices into shared memory
         if (row < N && i + coloff < D) {
             tile_Q[rowoff][coloff] = Q[pile*(N*D) + row*D + (i+coloff)];
@@ -98,6 +98,7 @@ __global__ void reduce_max_sub_exp(float *S, int N) {
     __syncthreads();
         
     // Process Reduce-max on shared memory vector 'aux'
+    int active = N;
     for (; active > 1; active = ceil(active, 2)) {
         int stride = ceil(active, 2);
         if (col + stride < active)
@@ -128,6 +129,7 @@ __global__ void reduce_sum_div(float *S, int N) {
     __syncthreads();
         
     // Process Reduce-max on shared memory vector 'aux'
+    int active = N;
     for (; active > 1; active = ceil(active, 2)) {
         int stride = ceil(active, 2);
         if (col + stride < active)
@@ -154,27 +156,27 @@ __global__ void matrix_multiply(const float *P, const float *V, float *O,
     int rowoff = threadIdx.y; // row offset in tile
     int coloff = threadIdx.x; // column offset in tile
     
-    __shared__ float tileA[tile_size][tile_size];
-    __shared__ float tileB[tile_size][tile_size];
+    __shared__ float tile_P[tile_size][tile_size];
+    __shared__ float tile_V[tile_size][tile_size];
 
     float acc = 0.0;
     for (int i = 0; i < K; i += tile_size) {
         // Load tiles of operand matrices into shared memory
         if (row < M && i + coloff < K)
-            tileA[rowoff][coloff] = A[pile*(M*K) + row*K + (i+coloff)]; // A[row][i+coloff]
+            tile_P[rowoff][coloff] = P[pile*(M*K) + row*K + (i+coloff)]; // A[row][i+coloff]
         if (col < N && i + rowoff < K)
-            tileB[rowoff][coloff] = B[pile*(K*N) + (i+rowoff)*N + col]; // B[i+rowoff][col];
+            tile_V[rowoff][coloff] = V[pile*(K*N) + (i+rowoff)*N + col]; // B[i+rowoff][col];
         __syncthreads();
 
         // Compute matrix multiplication on tile
         for (int l = 0; l < tile_size; l++) {
             if (row < M && col < N && i + l < K)
-                acc += tileA[rowoff][l] * tileB[l][coloff];
+                acc += tile_P[rowoff][l] * tile_V[l][coloff];
         }
         __syncthreads(); // Guarantee that the operation on tile is done across SM.
     }
     if (row < M && col < N)
-        C[pile*(M*N) + row*N + col] = acc;
+        O[pile*(M*N) + row*N + col] = acc;
 }
 
 
@@ -256,20 +258,20 @@ torch::Tensor naive_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     dim3 ker1_GridDim(num_tiles, num_tiles, B*nh);
     dim3 ker1_BlockDim(tile_size, tile_size, 1);
     scaled_dot_product<<<ker1_GridDim, ker1_BlockDim>>> (
-        Q, K, T, scale, N, d
+        Q.data_ptr(), K.data_ptr(), T.data_ptr(), scale, N, d
     );
 
     dim3 ker2_GridDim(N, B*nh, 1);
     dim3 ker2_BlockDim(N, 1, 1);
     int  ker2_smem_size = sizeof(float) * N;
-    reduce_max_sub_exp<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> (T, N);
-    reduce_sum_div<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> (T, N);
+    reduce_max_sub_exp<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> (T.data_ptr(), N);
+    reduce_sum_div<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> (T.data_ptr(), N);
 
     dim3 ker3_GridDim(ceil(d, tile_size), ceil(N, tile_size), B*nh);
     dim3 ker3_BlockDim(tile_size, tile_size, 1);
     matrix_multiply<<<ker3_GridDim, ker3_BlockDim>>> (
-        T, V, O, N, N, d
-    )
+        T.data_ptr(), V.data_ptr(), O.data_ptr(), N, N, d
+    );
 
     // Return output
     O = O.to(torch::kCPU);
