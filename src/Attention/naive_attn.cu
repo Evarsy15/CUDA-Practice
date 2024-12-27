@@ -4,12 +4,6 @@
 #include <cuda_runtime.h>
 #define tile_size 32
 
-// Implement naive_attention kernel below
-// __global__ void matmul() {}
-// __global__ void reduce_sum() {}
-// __global__ void reduce_max() {}
-// ...
-
 __forceinline__ __host__ __device__ unsigned int ceil(unsigned int M, unsigned int N) {
     // assert(N != 0);
     return (M + N - 1) / N;
@@ -20,30 +14,14 @@ __forceinline__ __device__ double max_float(const float a, const float b) {
 }
 
 /*
-    transpose(A, A_T, M, N) :
-        Transpose M×N-matrix A into A_T.
-*/
-__global__ void transpose(const float *A, float *A_T, const int M, const int N) {
-    int row = blockDim.x * blockIdx.x + threadIdx.x;
-    int col = blockDim.y * blockIdx.y + threadIdx.y;
-
-    __shared__ float tileA[tile_size][tile_size+1];
-    if (row < M && col < N)
-        tileA[threadIdx.y][threadIdx.x] = A[row*N + col];
-
-    if (row < M && col < N)
-        A_T[col*M + row] = tileA[threadIdx.y][threadIdx.x];
-}
-
-/*
     scaled_dot_product(Q, K, S, a, N, D):
         Compute scaled-dot-product S = a * (Q * K_T); S_ij = a * <q_i, k_j>
     
     N : Sequence Length
     D : Embedding Size
 
-    Q : L×E-matrix of Query token
-    K : L×E-matrix of Key token
+    Q : N×D-matrix of Query token
+    K : N×D-matrix of Key token
 */
 __global__ void scaled_dot_product(const float *Q, const float *K, float *S, 
                                    const float a, const int N, const int D) {
@@ -52,6 +30,8 @@ __global__ void scaled_dot_product(const float *Q, const float *K, float *S,
 
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int col = blockDim.x * blockIdx.x + threadIdx.x;
+    int rowbase = blockDim.y * blockIdx.y;
+    int colbase = blockDim.x * blockIdx.x;
     int rowoff = threadIdx.y;
     int coloff = threadIdx.x;
 
@@ -61,9 +41,9 @@ __global__ void scaled_dot_product(const float *Q, const float *K, float *S,
     float acc = 0.0;
     for (int i = 0; i < D; i += tile_size) {
         // Load tiles of operand matrices into shared memory
-        if (row < N && i + coloff < D) {
-            tile_Q[rowoff][coloff] = Q[pile*(N*D) + row*D + (i+coloff)];
-            tile_K[rowoff][coloff] = K[pile*(N*D) + row*D + (i+coloff)];
+        if (row < N && col < N && i + coloff < D) {
+            tile_Q[rowoff][coloff] = Q[pile*(N*D) + (rowbase + rowoff)*D + (i+coloff)];
+            tile_K[rowoff][coloff] = K[pile*(N*D) + (colbase + rowoff)*D + (i+coloff)];
         }
         __syncthreads();
 
@@ -110,6 +90,44 @@ __global__ void reduce_max_sub_exp(float *S, int N) {
     S[idx] = exp(S[idx] - aux[0]);
 }
 
+__global__ void reduce_max_sub_exp_2(float *S, int N, int BlockSize) {
+    int pile = blockIdx.y;
+    int row  = blockIdx.x;
+    int col  = threadIdx.x;
+    int idx  = pile*(N*N) + row*N + col;
+    
+    extern __shared__ float aux[];
+    float reduce_max_val = -INFINITY;
+
+    // Reduce-max on each row of S
+    for (int i = 0; i < N; i += BlockSize) {
+        // Load target row-vector into shared memory
+        if (i + col < N)
+            aux[col] = S[idx + i];
+        else
+            aux[col] = -INFINITY;
+        __syncthreads();
+        
+        // Process Reduce-max on shared memory vector 'aux'
+        int active = BlockSize;
+        for (; active > 1; active = ceil(active, 2)) {
+            int stride = ceil(active, 2);
+            if (col + stride < active)
+                aux[col] = max_float(aux[col], aux[col + stride]);
+            __syncthreads();
+        }
+
+        reduce_max_val = max_float(aux[0], reduce_max_val);
+    }
+        
+    // Compute exp(S-m) on each row
+    __syncthreads();
+    for (int i = 0; i < N; i += BlockSize) {
+        if (i + col < N)
+            S[idx + i] = exp(S[idx + i] - reduce_max_val);
+    }
+}
+
 /*
     reduce_sum_div(S, N):
         Compute row-wise reduce-sum and broadcast-div in a row.
@@ -137,8 +155,47 @@ __global__ void reduce_sum_div(float *S, int N) {
         __syncthreads();
     }
         
-    // Compute exp(S-m) on each row
+    // Compute S_ij / sum(S_ij)
     S[idx] = S[idx] / aux[0];
+}
+
+__global__ void reduce_sum_div_2(float *S, int N, int BlockSize) {
+    int pile = blockIdx.y;
+    int row  = blockIdx.x;
+    int col  = threadIdx.x;
+    int idx  = pile*(N*N) + row*N + col;
+
+    // Load target row-vector into shared memory
+    extern __shared__ float aux[];
+    float reduce_sum_val = 0.0;
+
+    // Reduce-sum on each row of R = exp(S-m)
+    for (int i = 0; i < N; i += BlockSize) {
+        // Load target row-vector into shared memory
+        if (i + col < N)
+            aux[col] = S[idx + i];
+        else
+            aux[col] = 0.0;
+        __syncthreads();
+
+        // Process Reduce-max on shared memory vector 'aux'
+        int active = BlockSize;
+        for (; active > 1; active = ceil(active, 2)) {
+            int stride = ceil(active, 2);
+            if (col + stride < active)
+                aux[col] += aux[col + stride];
+            __syncthreads();
+        }
+
+        reduce_sum_val += aux[0];
+    }
+    
+    // Compute S_ij / sum(S_ij)
+    __syncthreads();
+    for (int i = 0; i < N; i += BlockSize) {
+        if (i + col < N)
+            S[idx + i] = S[idx + i] / reduce_sum_val;
+    }
 }
 
 /*
@@ -148,7 +205,7 @@ __global__ void reduce_sum_div(float *S, int N) {
 __global__ void matrix_multiply(const float *P, const float *V, float *O,
                                 const int M, const int K, const int N) {
     // Matrix Pile ID
-    int pile = blockDim.z * blockIdx.z + threadIdx.z;
+    int pile = blockIdx.z;
 
     // Row and Column
     int row = blockDim.y * blockIdx.y + threadIdx.y;
@@ -179,50 +236,6 @@ __global__ void matrix_multiply(const float *P, const float *V, float *O,
         O[pile*(M*N) + row*N + col] = acc;
 }
 
-
-/*
-    row_wise_softmax(R, S) : 
-        Apply softmax each row of matrix R[b][h], save into row of matrix S[b][h] of same position.
-*/
-inline __device__ double reduce_max(int N, double *src, double *aux) {
-    int offset = threadIdx.x;
-    int active = N; // Length of active section
-    
-    // Load source array into shared memory
-    if (offset < N)
-        aux[offset] = src[offset];
-
-    // Find maximum element of the sub-array
-    // ※ Read 'Reduction' in report.
-    for (; active > 1; active = ceil(active, 2)) {
-        __syncthreads();
-        int stride = ceil(active, 2);
-        if (offset + stride < active)
-            aux[offset] = max_double(aux[offset], aux[offset + stride]);
-    }
-
-    return aux[0];
-}
-
-inline __device__ double reduce_sum() {
-    int offset = threadIdx.x;
-    int active = N; // Length of active section
-    
-    // Load source array into shared memory
-    if (offset < N)
-        aux[offset] = src[offset];
-
-    // Find sum of elements in sub-array
-    for (; active > 1; active = ceil(active, 2)) {
-        __syncthreads();
-        int stride = ceil(active, 2);
-        if (offset + stride < active)
-            aux[offset] += aux[offset + stride];        
-    }
-
-    return aux[0];
-}
-
 torch::Tensor naive_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     const int B = Q.size(0);	// Batch size
     const int nh = Q.size(1);	// Number of heads
@@ -247,33 +260,104 @@ torch::Tensor naive_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     printf("Max Threads per Block : %d\n", max_threads_per_block);
     printf("Max shared memory: %d\n", max_sram_size);
 
-    // ============= Call kernels ==================
-    // matmul<<>>();
-    // softmax<<>>();
-    // ..
-    // =============================================
     float scale = (float) ((double) 1.0 / sqrt(d));
-
     int  num_tiles = ceil(N, tile_size);
     dim3 ker1_GridDim(num_tiles, num_tiles, B*nh);
     dim3 ker1_BlockDim(tile_size, tile_size, 1);
     scaled_dot_product<<<ker1_GridDim, ker1_BlockDim>>> (
-        Q.data_ptr(), K.data_ptr(), T.data_ptr(), scale, N, d
+        (float*) Q.data_ptr(), (float*) K.data_ptr(), (float*) T.data_ptr(), scale, N, d
     );
 
-    dim3 ker2_GridDim(N, B*nh, 1);
-    dim3 ker2_BlockDim(N, 1, 1);
-    int  ker2_smem_size = sizeof(float) * N;
-    reduce_max_sub_exp<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> (T.data_ptr(), N);
-    reduce_sum_div<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> (T.data_ptr(), N);
+    if (N <= max_threads_per_block) {
+        dim3 ker2_GridDim(N, B*nh, 1);
+        dim3 ker2_BlockDim(N, 1, 1);
+        int  ker2_smem_size = sizeof(float) * N;
+
+        reduce_max_sub_exp<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) T.data_ptr(), N);
+        reduce_sum_div<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) T.data_ptr(), N);
+    } else {
+        int BlockSize = 512;
+        dim3 ker2_GridDim(N, B*nh, 1);
+        dim3 ker2_BlockDim(BlockSize, 1, 1);
+        int  ker2_smem_size = sizeof(float) * BlockSize;
+
+        reduce_max_sub_exp_2<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) T.data_ptr(), N, BlockSize);
+        reduce_sum_div_2<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) T.data_ptr(), N, BlockSize);
+    }
 
     dim3 ker3_GridDim(ceil(d, tile_size), ceil(N, tile_size), B*nh);
     dim3 ker3_BlockDim(tile_size, tile_size, 1);
     matrix_multiply<<<ker3_GridDim, ker3_BlockDim>>> (
-        T.data_ptr(), V.data_ptr(), O.data_ptr(), N, N, d
+        (float*) T.data_ptr(), (float*) V.data_ptr(), (float*) O.data_ptr(), N, N, d
     );
 
     // Return output
-    O = O.to(torch::kCPU);
     return O;
+}
+
+torch::Tensor scaled_dot_product(torch::Tensor Q, torch::Tensor K) {
+    const int B = Q.size(0);	// Batch size
+    const int nh = Q.size(1);	// Number of heads
+    const int N = Q.size(2);	// Sequence size
+    const int d = Q.size(3);	// Embedding size
+
+    auto T = torch::zeros({B, nh, N, N}); // Temporal memory for storing QK^T/√d
+    torch::Device device(torch::kCUDA);
+    T = T.to(device);
+
+    float scale = (float) ((double) 1.0 / sqrt(d));
+    printf("1/√d = %f\n", scale);
+
+    int  num_tiles = ceil(N, tile_size);
+    dim3 GridDim(num_tiles, num_tiles, B*nh);
+    dim3 BlockDim(tile_size, tile_size, 1);
+    scaled_dot_product<<<GridDim, BlockDim>>> (
+        (float*) Q.data_ptr(), (float*) K.data_ptr(), (float*) T.data_ptr(), scale, N, d
+    );
+
+    return T;
+}
+
+void softmax(torch::Tensor S) {
+    const int B = S.size(0);	// Batch size
+    const int nh = S.size(1);	// Number of heads
+    const int N = S.size(2);	// Sequence size
+
+    int max_threads_per_block;
+    cudaDeviceGetAttribute(&max_threads_per_block, cudaDevAttrMaxThreadsPerBlock, 0);
+    printf("Squence Length : %d, Max Threads per Block : %d\n", N, max_threads_per_block);
+
+    if (N <= max_threads_per_block) {
+        dim3 ker2_GridDim(N, B*nh, 1);
+        dim3 ker2_BlockDim(N, 1, 1);
+        int  ker2_smem_size = sizeof(float) * N;
+
+        reduce_max_sub_exp<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) S.data_ptr(), N);
+        reduce_sum_div<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) S.data_ptr(), N);
+    } else {
+        int BlockSize = 512;
+        dim3 ker2_GridDim(N, B*nh, 1);
+        dim3 ker2_BlockDim(BlockSize, 1, 1);
+        int  ker2_smem_size = sizeof(float) * BlockSize;
+
+        reduce_max_sub_exp_2<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) S.data_ptr(), N, BlockSize);
+        reduce_sum_div_2<<<ker2_GridDim, ker2_BlockDim, ker2_smem_size>>> ((float*) S.data_ptr(), N, BlockSize);
+    }
+}
+
+torch::Tensor matrix_multiply(torch::Tensor P, torch::Tensor V) {
+    const int B = V.size(0);	// Batch size
+    const int nh = V.size(1);	// Number of heads
+    const int N = V.size(2);	// Sequence size
+    const int d = V.size(3);	// Embedding size
+
+    auto O = torch::zeros_like(V);
+    torch::Device device(torch::kCUDA);
+    O = O.to(device);
+
+    dim3 GridDim(ceil(d, tile_size), ceil(N, tile_size), B*nh);
+    dim3 BlockDim(tile_size, tile_size, 1);
+    matrix_multiply<<<GridDim, BlockDim>>> (
+        (float*) P.data_ptr(), (float*) V.data_ptr(), (float*) O.data_ptr(), N, N, d
+    );
 }
