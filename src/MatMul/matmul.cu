@@ -1,4 +1,4 @@
-#include "../include/cuda_aux.cuh"
+#include "cuda_aux.cuh"
 #include "matmul.h"
 
 __global__ void MatMulKernel(const double *A, const double *B, double *C,
